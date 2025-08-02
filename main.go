@@ -25,6 +25,116 @@ var upgrader = websocket.Upgrader{
 	WriteBufferSize: 1024,
 }
 
+// ConnectionMonitor tracks active connections to prevent overload
+type ConnectionMonitor struct {
+	activeConnections map[string]*ConnectionInfo
+	maxConnections    int
+	mutex             sync.RWMutex
+}
+
+type ConnectionInfo struct {
+	conn         *websocket.Conn
+	roomID       string
+	connectedAt  time.Time
+	lastActivity time.Time
+}
+
+var connectionMonitor = &ConnectionMonitor{
+	activeConnections: make(map[string]*ConnectionInfo),
+	maxConnections:    1000, // Configurable limit
+}
+
+func (cm *ConnectionMonitor) AddConnection(playerID string, conn *websocket.Conn, roomID string) {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	
+	cm.activeConnections[playerID] = &ConnectionInfo{
+		conn:         conn,
+		roomID:       roomID,
+		connectedAt:  time.Now(),
+		lastActivity: time.Now(),
+	}
+	
+	usage := (len(cm.activeConnections) * 100) / cm.maxConnections
+	log.Printf("📊 Active connections: %d/%d (%d%%)", len(cm.activeConnections), cm.maxConnections, usage)
+	
+	if usage > 80 {
+		log.Printf("⚠️ Connection pool at %d%% capacity", usage)
+	}
+}
+
+func (cm *ConnectionMonitor) RemoveConnection(playerID string) {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	
+	if connInfo, exists := cm.activeConnections[playerID]; exists {
+		// Force close WebSocket if still open
+		if connInfo.conn != nil {
+			connInfo.conn.Close()
+		}
+		delete(cm.activeConnections, playerID)
+		log.Printf("🔌 Connection %s removed. Active: %d", playerID, len(cm.activeConnections))
+	}
+}
+
+func (cm *ConnectionMonitor) UpdateActivity(playerID string) {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
+	
+	if connInfo, exists := cm.activeConnections[playerID]; exists {
+		connInfo.lastActivity = time.Now()
+	}
+}
+
+func (cm *ConnectionMonitor) GetStats() map[string]interface{} {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
+	
+	usage := (len(cm.activeConnections) * 100) / cm.maxConnections
+	return map[string]interface{}{
+		"active": len(cm.activeConnections),
+		"max":    cm.maxConnections,
+		"usage":  usage,
+	}
+}
+
+func (cm *ConnectionMonitor) CleanupStaleConnections() {
+	cm.mutex.Lock()
+	defer cm.mutex.Unlock()
+	
+	now := time.Now()
+	staleThreshold := 30 * time.Second
+	var staleConnections []string
+	
+	for playerID, connInfo := range cm.activeConnections {
+		if now.Sub(connInfo.lastActivity) > staleThreshold {
+			staleConnections = append(staleConnections, playerID)
+		}
+	}
+	
+	for _, playerID := range staleConnections {
+		if connInfo := cm.activeConnections[playerID]; connInfo != nil {
+			log.Printf("🧹 Force cleaning stale connection: %s", playerID)
+			if connInfo.conn != nil {
+				connInfo.conn.Close()
+			}
+			delete(cm.activeConnections, playerID)
+		}
+	}
+	
+	if len(staleConnections) > 0 {
+		log.Printf("🧹 Force cleaned %d stale connections", len(staleConnections))
+	}
+}
+
+func (cm *ConnectionMonitor) CheckCapacity() bool {
+	cm.mutex.RLock()
+	defer cm.mutex.RUnlock()
+	
+	usage := (len(cm.activeConnections) * 100) / cm.maxConnections
+	return usage < 95 // Reject connections at 95% capacity
+}
+
 // Player represents a connected player
 type Player struct {
 	ID          string                 `json:"id"`
@@ -36,6 +146,26 @@ type Player struct {
 	Conn        *websocket.Conn        `json:"-"`
 	LastSeen    time.Time              `json:"lastSeen"`
 	IsConnected bool                   `json:"isConnected"`
+}
+
+// SafeClose safely closes a WebSocket connection with proper error handling
+func (p *Player) SafeClose() {
+	if p.Conn != nil {
+		// Try graceful close first
+		err := p.Conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Player leaving room"))
+		if err != nil {
+			log.Printf("⚠️ Error sending close message for %s: %v", p.ID, err)
+		}
+		
+		// Close the connection
+		err = p.Conn.Close()
+		if err != nil {
+			log.Printf("⚠️ Error closing connection for %s: %v", p.ID, err)
+		}
+		
+		p.Conn = nil
+		log.Printf("🔒 Connection safely closed for player %s", p.ID)
+	}
 }
 
 // Message represents WebSocket messages
@@ -53,6 +183,19 @@ type Room struct {
 	mutex     sync.RWMutex
 }
 
+// forceCleanupAllConnections forcefully closes all connections in the room
+func (r *Room) forceCleanupAllConnections() {
+	r.mutex.Lock()
+	defer r.mutex.Unlock()
+	
+	log.Printf("🧹 Force cleaning all connections in room %s", r.ID)
+	for playerID, player := range r.Players {
+		player.SafeClose()
+		connectionMonitor.RemoveConnection(playerID)
+	}
+	r.Players = make(map[string]*Player) // Clear the map
+}
+
 // GameServer manages all rooms and game state
 type GameServer struct {
 	rooms map[string]*Room
@@ -67,7 +210,121 @@ func NewGameServer() *GameServer {
 	// Start cleanup routine for disconnected players
 	go gs.cleanupDisconnectedPlayers()
 	
+	// Start connection monitoring
+	go gs.startConnectionMonitoring()
+	
 	return gs
+}
+
+// startConnectionMonitoring monitors connection health
+func (gs *GameServer) startConnectionMonitoring() {
+	ticker := time.NewTicker(30 * time.Second) // Check every 30 seconds
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ticker.C:
+			connectionMonitor.CleanupStaleConnections()
+			
+			stats := connectionMonitor.GetStats()
+			usage := stats["usage"].(int)
+			
+			log.Printf("📊 Connection Monitor: %d/%d (%d%%)", stats["active"], stats["max"], usage)
+			
+			if usage > 90 {
+				log.Printf("🚨 CRITICAL: Connection pool at %d%% - Emergency cleanup!", usage)
+				gs.emergencyCleanup()
+			} else if usage > 70 {
+				log.Printf("⚠️ Connection pool stressed (%d%%), running aggressive cleanup", usage)
+				gs.aggressiveCleanup()
+			}
+		}
+	}
+}
+
+// emergencyCleanup performs immediate cleanup when connection pool is critical
+func (gs *GameServer) emergencyCleanup() {
+	log.Printf("🚨 EMERGENCY CLEANUP INITIATED")
+	
+	gs.mutex.Lock()
+	defer gs.mutex.Unlock()
+	
+	// Force close all connections in empty rooms
+	for roomID, room := range gs.rooms {
+		room.mutex.RLock()
+		isEmpty := len(room.Players) == 0
+		room.mutex.RUnlock()
+		
+		if isEmpty {
+			room.forceCleanupAllConnections()
+			delete(gs.rooms, roomID)
+		}
+	}
+	
+	connectionMonitor.CleanupStaleConnections()
+	
+	stats := connectionMonitor.GetStats()
+	log.Printf("🚨 Emergency cleanup complete. Rooms: %d, Connections: %d", len(gs.rooms), stats["active"])
+}
+
+// aggressiveCleanup performs faster cleanup when connection pool is stressed
+func (gs *GameServer) aggressiveCleanup() {
+	now := time.Now()
+	aggressiveTimeout := 2 * time.Minute // 2 minutes instead of 5
+	cleanedPlayers := 0
+	cleanedRooms := 0
+	
+	gs.mutex.RLock()
+	roomsToClean := make([]string, 0, len(gs.rooms))
+	for roomID := range gs.rooms {
+		roomsToClean = append(roomsToClean, roomID)
+	}
+	gs.mutex.RUnlock()
+	
+	for _, roomID := range roomsToClean {
+		gs.mutex.RLock()
+		room, exists := gs.rooms[roomID]
+		gs.mutex.RUnlock()
+		
+		if !exists {
+			continue
+		}
+		
+		room.mutex.Lock()
+		playersToRemove := []string{}
+		
+		// More aggressive player cleanup
+		for playerID, player := range room.Players {
+			if !player.IsConnected && now.Sub(player.LastSeen) > aggressiveTimeout {
+				playersToRemove = append(playersToRemove, playerID)
+			}
+		}
+		
+		for _, playerID := range playersToRemove {
+			if player := room.Players[playerID]; player != nil {
+				player.SafeClose()
+				connectionMonitor.RemoveConnection(playerID)
+				delete(room.Players, playerID)
+				cleanedPlayers++
+			}
+		}
+		
+		// Remove inactive rooms more quickly
+		roomAge := now.Sub(room.CreatedAt)
+		isEmpty := len(room.Players) == 0
+		
+		room.mutex.Unlock()
+		
+		if isEmpty && roomAge > time.Minute {
+			room.forceCleanupAllConnections()
+			gs.mutex.Lock()
+			delete(gs.rooms, roomID)
+			gs.mutex.Unlock()
+			cleanedRooms++
+		}
+	}
+	
+	log.Printf("🧹 Aggressive cleanup: %d players, %d rooms removed", cleanedPlayers, cleanedRooms)
 }
 
 // cleanupDisconnectedPlayers removes players who have been disconnected for too long
@@ -183,6 +440,10 @@ func (gs *GameServer) AddPlayer(player *Player) {
 	player.IsConnected = true
 	player.LastSeen = time.Now()
 	room.Players[player.ID] = player
+	
+	// Add to connection monitor
+	connectionMonitor.AddConnection(player.ID, player.Conn, player.RoomID)
+	
 	log.Printf("➕ Added player %s (%s) to room %s. Room players: %d", player.Name, player.ID, player.RoomID, len(room.Players))
 }
 
@@ -221,11 +482,13 @@ func (gs *GameServer) DisconnectPlayer(playerID string, roomID string) {
 	defer room.mutex.Unlock()
 	
 	if player, exists := room.Players[playerID]; exists {
-		// Close connection and mark as disconnected, but keep player data
-		if player.Conn != nil {
-		player.Conn.Close()
-		}
-		player.Conn = nil
+		// Safe connection cleanup
+		player.SafeClose()
+		
+		// Remove from connection monitor
+		connectionMonitor.RemoveConnection(playerID)
+		
+		// Mark as disconnected but keep player data
 		player.IsConnected = false
 		player.LastSeen = time.Now()
 		
@@ -235,7 +498,7 @@ func (gs *GameServer) DisconnectPlayer(playerID string, roomID string) {
 		disconnectMsg := Message{
 			Type:     "playerDisconnected",
 			PlayerID: playerID,
-			Data:     map[string]interface{}{},
+			Data:     map[string]interface{}{"id": playerID},
 		}
 		gs.BroadcastToRoom(disconnectMsg, roomID, playerID)
 		log.Printf("📢 Notified other players in room %s about %s disconnecting", roomID, player.Name)
@@ -359,6 +622,14 @@ func generatePlayerColor(playerID string) string {
 }
 
 func (gs *GameServer) handleConnection(w http.ResponseWriter, r *http.Request) {
+	// Check connection capacity
+	if !connectionMonitor.CheckCapacity() {
+		stats := connectionMonitor.GetStats()
+		log.Printf("🚨 Connection limit reached (%d%%), rejecting new connection", stats["usage"])
+		http.Error(w, "Server overloaded", http.StatusTooManyRequests)
+		return
+	}
+	
 	// Extract room ID from query parameters
 	roomID := r.URL.Query().Get("room")
 	if roomID == "" {
@@ -624,9 +895,53 @@ func main() {
 	// Add routes
 	mux.HandleFunc("/ws", gameServer.handleConnection)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("Flying Car Game Server Running - Room Support with Player Persistence Enabled"))
+		
+		stats := connectionMonitor.GetStats()
+		response := fmt.Sprintf(`{
+			"status": "Flying Car Game Server Running - Enhanced Connection Management",
+			"features": [
+				"Room-based multiplayer",
+				"Player state persistence (5min timeout)",
+				"WebSocket real-time communication",
+				"Advanced connection pool management",
+				"DoS protection & monitoring",
+				"Emergency cleanup procedures"
+			],
+			"connectionStats": {
+				"active": %d,
+				"max": %d,
+				"usage": %d
+			}
+		}`, stats["active"], stats["max"], stats["usage"])
+		
+		w.Write([]byte(response))
+	})
+	
+	// Health check endpoint
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		
+		stats := connectionMonitor.GetStats()
+		status := "healthy"
+		if stats["usage"].(int) > 90 {
+			status = "stressed"
+		}
+		
+		response := fmt.Sprintf(`{
+			"status": "%s",
+			"uptime": %d,
+			"connections": {
+				"active": %d,
+				"max": %d,
+				"usage": %d
+			},
+			"timestamp": "%s"
+		}`, status, int(time.Now().Unix()), stats["active"], stats["max"], stats["usage"], time.Now().Format(time.RFC3339))
+		
+		w.Write([]byte(response))
 	})
 
 	// Wrap the mux with CORS middleware
@@ -644,8 +959,10 @@ func main() {
 
 	log.Println("WebSocket server starting on", address)
 	log.Printf("🌐 WebSocket endpoint: ws://%s/ws?room=ROOM_ID", address)
-	log.Printf("🏥 Health check: http://%s/", address)
+	log.Printf("🏥 Health check: http://%s/health", address)
 	log.Printf("🏠 Room-based multiplayer enabled")
 	log.Printf("💾 Player state persistence enabled (5min timeout)")
+	log.Printf("🔒 Connection pool management enabled (max: %d)", connectionMonitor.maxConnections)
+	log.Printf("⚡ Ready for Railway deployment")
 	log.Fatal(http.ListenAndServe(address, handler))
 } 
