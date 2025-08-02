@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 	"time"
 
@@ -631,11 +632,20 @@ func main() {
 	// Wrap the mux with CORS middleware
 	handler := corsMiddleware(mux)
 
-	log.Println("WebSocket server starting on :8082")
-	log.Printf("🌐 WebSocket endpoint: ws://localhost:8082/ws?room=ROOM_ID")
-	log.Printf("🏥 Health check: http://localhost:8082/")
+	// Get port from environment variable (Railway/cloud deployment)
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8082" // Default port for local development
+	}
+	
+	// Bind to 0.0.0.0 for cloud deployment
+	host := "0.0.0.0"
+	address := fmt.Sprintf("%s:%s", host, port)
+
+	log.Println("WebSocket server starting on", address)
+	log.Printf("🌐 WebSocket endpoint: ws://%s/ws?room=ROOM_ID", address)
+	log.Printf("🏥 Health check: http://%s/", address)
 	log.Printf("🏠 Room-based multiplayer enabled")
 	log.Printf("💾 Player state persistence enabled (5min timeout)")
-	log.Fatal(http.ListenAndServe("127.0.0.1:8082", handler))
-
+	log.Fatal(http.ListenAndServe(address, handler))
 } 
